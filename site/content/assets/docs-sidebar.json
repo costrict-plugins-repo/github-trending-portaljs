@@ -1,0 +1,156 @@
+[
+  {
+    "title": "Get started",
+    "links": [
+      {
+        "title": "Introduction",
+        "href": "/docs"
+      },
+      {
+        "title": "Quickstart — the AI path",
+        "href": "/docs/quickstart"
+      },
+      {
+        "title": "Manual setup — build by hand",
+        "href": "/docs/manual-setup"
+      }
+    ]
+  },
+  {
+    "title": "Core concepts",
+    "links": [
+      {
+        "title": "Core concepts",
+        "href": "/docs/core-concepts"
+      },
+      {
+        "title": "Architecture decision framework",
+        "href": "/docs/architecture/decision-framework"
+      }
+    ]
+  },
+  {
+    "title": "Skills",
+    "links": [
+      {
+        "title": "Skills reference",
+        "href": "/docs/skills"
+      },
+      {
+        "title": "/portaljs-architect",
+        "href": "/docs/skills/portaljs-architect"
+      },
+      {
+        "title": "/portaljs-new-portal",
+        "href": "/docs/skills/portaljs-new-portal"
+      },
+      {
+        "title": "/portaljs-add-dataset",
+        "href": "/docs/skills/portaljs-add-dataset"
+      },
+      {
+        "title": "/portaljs-add-resource",
+        "href": "/docs/skills/portaljs-add-resource"
+      },
+      {
+        "title": "/portaljs-add-chart",
+        "href": "/docs/skills/portaljs-add-chart"
+      },
+      {
+        "title": "/portaljs-add-map",
+        "href": "/docs/skills/portaljs-add-map"
+      },
+      {
+        "title": "/portaljs-connect-ckan",
+        "href": "/docs/skills/portaljs-connect-ckan"
+      },
+      {
+        "title": "/portaljs-migrate",
+        "href": "/docs/skills/portaljs-migrate"
+      },
+      {
+        "title": "/portaljs-define-schema",
+        "href": "/docs/skills/portaljs-define-schema"
+      },
+      {
+        "title": "/portaljs-check-data-quality",
+        "href": "/docs/skills/portaljs-check-data-quality"
+      },
+      {
+        "title": "/portaljs-deploy",
+        "href": "/docs/skills/portaljs-deploy"
+      }
+    ]
+  },
+  {
+    "title": "Guides",
+    "links": [
+      {
+        "title": "Guides",
+        "href": "/docs/guides"
+      },
+      {
+        "title": "Add tabular data",
+        "href": "/docs/guides/add-tabular-data"
+      },
+      {
+        "title": "Scaling data / large files",
+        "href": "/docs/guides/scaling-data"
+      },
+      {
+        "title": "Add a chart",
+        "href": "/docs/guides/add-a-chart"
+      },
+      {
+        "title": "Render a map",
+        "href": "/docs/guides/render-a-map"
+      },
+      {
+        "title": "Connect a CKAN backend",
+        "href": "/docs/guides/connect-a-ckan-backend"
+      },
+      {
+        "title": "Deploy",
+        "href": "/docs/guides/deploy"
+      },
+      {
+        "title": "Theming",
+        "href": "/docs/guides/theming"
+      }
+    ]
+  },
+  {
+    "title": "Templates & extending",
+    "links": [
+      {
+        "title": "Templates",
+        "href": "/docs/templates"
+      },
+      {
+        "title": "Authoring skills",
+        "href": "/docs/authoring-skills"
+      },
+      {
+        "title": "Backends",
+        "href": "/docs/backends"
+      },
+      {
+        "title": "PortalJS Arc (hosting)",
+        "href": "/docs/arc"
+      }
+    ]
+  },
+  {
+    "title": "More",
+    "links": [
+      {
+        "title": "Open-source framework docs",
+        "href": "/opensource"
+      },
+      {
+        "title": "PortalJS Cloud (managed)",
+        "href": "/cloud/docs"
+      }
+    ]
+  }
+]

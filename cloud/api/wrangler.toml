@@ -1,0 +1,58 @@
+# PortalJS Arc — Deploy API Worker (staging).
+name = "arc-api-staging"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+account_id = "83025b28472d6aa2bf5ae59f3724aa78"
+workers_dev = true
+
+[vars]
+ARC_HOST = "staging.arc.portaljs.com"
+MAX_FILES = "5000"
+MAX_BYTES = "104857600"
+LFS_HOST = "lfs.portaljs.com"
+
+# SECRET (NOT a var — provision at land, never commit the key):
+#   wrangler secret put GIFTLESS_JWT_PRIVATE_KEY < ~/.config/portaljs/giftless-rs256-private.pem
+#   wrangler secret put GIFTLESS_JWT_PRIVATE_KEY --env production < ~/.config/portaljs/giftless-rs256-private.pem
+# RS256 PKCS#8 PEM that signs Giftless LFS client tokens (POST /v1/repos/:slug/lfs-token).
+# Same private key Giftless holds to sign its verify callbacks; the matching public half
+# is the GIFTLESS_JWT_PUBLIC_KEY secret on the giftless worker. Until set, the endpoint 503s.
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "portaljs-arc-staging"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "portaljs-arc-staging"
+database_id = "9727b25f-471b-4942-8b16-b9da2391122a"
+
+# Custom route — enable once api.staging.arc.portaljs.com DNS + cert exist.
+# [[routes]]
+# pattern = "api.staging.arc.portaljs.com/*"
+# zone_name = "portaljs.com"
+
+# --- Production --- deploy with: wrangler deploy --env production
+# Prereq: proxied DNS record for api.arc.portaljs.com + ACM cert (covered by *.arc).
+[env.production]
+name = "arc-api"
+workers_dev = false
+
+[env.production.vars]
+ARC_HOST = "arc.portaljs.com"
+MAX_FILES = "5000"
+MAX_BYTES = "104857600"
+LFS_HOST = "lfs.portaljs.com"
+
+[[env.production.r2_buckets]]
+binding = "ASSETS"
+bucket_name = "portaljs-arc"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "portaljs-arc"
+database_id = "ce13c71f-d039-45f3-95d0-f8005ed986e4"
+
+[[env.production.routes]]
+pattern = "api.arc.portaljs.com/*"
+zone_name = "portaljs.com"

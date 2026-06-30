@@ -1,0 +1,67 @@
+{
+  // PortalJS — Giftless LFS host on Cloudflare Containers (PRODUCTION, po-g9y.11).
+  // Deploy:  cd giftless/cloudflare && ./scripts/deploy.sh
+  // The container runs the giftless/ image (../Dockerfile.cloudflare); this Worker
+  // fronts it. See cloudflare/README.md for the full runbook + go-live handoff.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "giftless",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-10",
+  "account_id": "83025b28472d6aa2bf5ae59f3724aa78",
+
+  // Reachable at https://giftless.<account>.workers.dev (kept on for pre-DNS
+  // validation: deploy + smoke-test the RS256/prod-R2 config here BEFORE the
+  // custom hostname resolves) AND at the production custom hostname below.
+  "workers_dev": true,
+
+  // Production custom hostname (po-g9y.11, LIVE 2026-06-27). custom_domain:true
+  // auto-provisions the PROXIED DNS record in the portaljs.com zone AND the edge
+  // cert — no manual DNS/ACM step (Universal SSL covers the single-label host
+  // lfs.portaljs.com; verified valid Let's Encrypt cert + 200 round-trip in prod).
+  "routes": [
+    { "pattern": "lfs.portaljs.com", "custom_domain": true }
+  ],
+
+  // Non-secret config. R2 creds + the JWT key are SECRETS (wrangler secret put),
+  // never here. R2_ENDPOINT is the account's S3 endpoint (account id is public).
+  "vars": {
+    "R2_ENDPOINT": "https://83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com",
+    "R2_REGION": "auto"
+  },
+
+  "containers": [
+    {
+      "class_name": "GiftlessContainer",
+      // Build the CF image from the giftless/ dir (one shared build context — the
+      // CF Dockerfile reuses r2storage.py + giftless.yaml, no duplication).
+      "image": "../Dockerfile.cloudflare",
+      "image_build_context": "..",
+      // basic = 1 GiB / (1/4) vCPU / 4 GB disk. uwsgi+python is comfortable here;
+      // lite (256 MiB) is too tight. Revisit if memory-pressured.
+      "instance_type": "basic",
+      // Singleton service (Giftless is stateless); a tiny headroom for rollouts.
+      "max_instances": 2
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GIFTLESS",
+        "class_name": "GiftlessContainer"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      // Container-backing DOs must be SQLite-backed.
+      "new_sqlite_classes": ["GiftlessContainer"]
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
