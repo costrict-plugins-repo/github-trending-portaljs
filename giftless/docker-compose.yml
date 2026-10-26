@@ -1,0 +1,26 @@
+# Local Giftless (RS256, matches the prod config in giftless.yaml — po-g9y.11).
+# Reads R2 creds + endpoint from a local .env (see .env.example), and the RS256
+# keypair from ./jwt_private_key + ./jwt_public_key (gitignored; generate with
+# scripts/gen-rs256-keys.sh).
+#
+#   cp .env.example .env        # fill in R2 creds (or: set -a; . ~/.config/portaljs/giftless-r2.env)
+#   ./scripts/gen-rs256-keys.sh # writes ./jwt_private_key + ./jwt_public_key
+#   docker compose up --build -d
+services:
+  giftless:
+    build: .
+    image: portaljs/giftless-r2:latest
+    ports:
+      - "8080:5000"
+    environment:
+      # R2 token creds are read by boto3 as standard AWS_* names.
+      AWS_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY}"
+      R2_ENDPOINT: "${R2_ENDPOINT:?set R2_ENDPOINT}"
+      R2_REGION: "${R2_REGION:-auto}"
+    volumes:
+      # RS256 keypair, mounted read-only. Never baked into the image. The public
+      # key verifies all tokens; the private key signs Giftless's verify callbacks.
+      - ./jwt_public_key:/etc/giftless/jwt_public_key:ro
+      - ./jwt_private_key:/etc/giftless/jwt_private_key:ro
+    restart: unless-stopped

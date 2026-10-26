@@ -1,0 +1,51 @@
+import { Html, Head, Main, NextScript } from 'next/document'
+import { withBasePath } from '../lib/basePath'
+import { LOCALE, t } from '../lib/i18n'
+
+// Raw <link> hrefs are not basePath-aware, so site-root paths below go through
+// withBasePath — otherwise they 404 when the portal is served under a sub-path.
+export default function Document() {
+  return (
+    <Html lang={LOCALE}>
+      <Head>
+        {/* Default PortalJS branding — PLACEHOLDER. Replace the files in `public/`
+            (favicon.ico, icon.svg, apple-touch-icon.png, icon-512.png) with your
+            own brand marks; these links can stay as-is once the files are swapped. */}
+        <link rel="icon" href={withBasePath('/favicon.ico')} sizes="any" />
+        <link rel="icon" type="image/svg+xml" href={withBasePath('/icon.svg')} />
+        <link rel="apple-touch-icon" href={withBasePath('/apple-touch-icon.png')} />
+        <meta name="description" content="__DESCRIPTION__" />
+        <meta name="theme-color" content="#f6f2e9" />
+        {/* DCAT feed autodiscovery — lets national/EU/US open-data portals (and
+            harvesters like data.europa.eu) find this catalog's machine-readable
+            metadata. /catalog.jsonld is the stable canonical feed, regenerated at
+            build by scripts/generate-dcat.ts. Additional profile/serialization feeds
+            are indexed in /catalog-feeds.json. See /portaljs-add-dcat. */}
+        <link
+          rel="alternate"
+          type="application/ld+json"
+          href={withBasePath('/catalog.jsonld')}
+          title={t('document.dcatFeedTitle')}
+        />
+        {/* Editorial type system (Claude Design import): Newsreader (serif),
+            Work Sans (sans), IBM Plex Mono (SQL editor). Loaded via <link> — no
+            build-time fetch, so the scaffold builds offline and ships no font
+            binaries. Referenced by the font-serif/sans/mono Tailwind utilities. */}
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Newsreader:ital,wght@0,400;0,500;0,600;1,400;1,500;1,600&family=Work+Sans:wght@400;500;600&display=swap"
+          rel="stylesheet"
+        />
+      </Head>
+      <body>
+        <Main />
+        <NextScript />
+      </body>
+    </Html>
+  )
+}

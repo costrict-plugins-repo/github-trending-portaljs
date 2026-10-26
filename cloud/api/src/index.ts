@@ -1,0 +1,376 @@
+// PortalJS Arc — Deploy API Worker (po-bn9).
+// POST /v1/deploy   — auth (Bearer token) → unpack a gzipped tar of `out/` →
+//                     write to R2 sites/<slug>/… → record in D1 → return the URL.
+// GET  /v1/deploy/:id — deployment status.
+// GET  /healthz       — liveness.
+//
+// Served at api.arc.portaljs.com (api.staging.arc.portaljs.com on staging).
+
+import { untar } from './untar'
+import {
+  userForToken,
+  loginForToken,
+  userRowForToken,
+  userAuthForToken,
+  ensureProject,
+  getOwnedProject,
+  recordDeployment,
+  getDeployment,
+  getDeploymentWithProject,
+  claimSourceSnapshot,
+  listSourceSnapshots,
+} from './db'
+import { mintLfsToken, normalizeActions, normalizeTtl, LFS_ORG } from './lfs'
+
+export interface Env {
+  ASSETS: R2Bucket
+  DB: D1Database
+  ARC_HOST: string // e.g. "staging.arc.portaljs.com"
+  MAX_FILES?: string
+  MAX_BYTES?: string
+  // Cap on the pre-build SOURCE-tree tarball (po-ce7) — separate from MAX_BYTES (the
+  // built `out/` export) since a source tree (minus node_modules/.git) can legitimately
+  // run larger than its build output.
+  MAX_SOURCE_BYTES?: string
+  // RS256 PKCS#8 PEM that signs Giftless LFS client tokens. Provisioned as a Worker
+  // secret (NOT a [vars] entry) — see wrangler.toml. Absent ⇒ /v1/repos/:slug/lfs-token
+  // returns 503. The matching public key is deployed on Giftless (GIFTLESS_JWT_PUBLIC_KEY).
+  GIFTLESS_JWT_PRIVATE_KEY?: string
+  // Giftless host the minted token targets (default lfs.portaljs.com).
+  LFS_HOST?: string
+}
+
+const RESERVED = new Set(['www', 'api', 'admin', 'staging', 'arc'])
+
+// Parse a numeric env var, falling back when unset or non-numeric (so a config typo
+// can't silently disable a limit by making it NaN).
+function intVar(v: string | undefined, fallback: number): number {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+// DNS-label slug: lowercase alphanumeric + hyphens, not reserved.
+export function validSlug(slug: string): boolean {
+  if (!slug || slug.length > 63 || RESERVED.has(slug)) return false
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)
+}
+
+// Reject anything that could escape sites/<slug>/.
+export function safeEntryName(name: string): boolean {
+  if (!name || name.startsWith('/') || name.includes('\0')) return false
+  return !name.split('/').some((seg) => seg === '..')
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' },
+  })
+}
+
+async function gunzip(body: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const stream = body.pipeThrough(new DecompressionStream('gzip'))
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+    total += value.length
+  }
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const c of chunks) {
+    out.set(c, off)
+    off += c.length
+  }
+  return out
+}
+
+export async function handleDeploy(request: Request, env: Env): Promise<Response> {
+  // Auth.
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const userId = await userForToken(env.DB, token)
+  if (!userId) return json({ error: 'invalid token' }, 401)
+
+  // Slug.
+  const slug = new URL(request.url).searchParams.get('slug')?.toLowerCase() ?? ''
+  if (!validSlug(slug)) return json({ error: `invalid slug "${slug}"` }, 400)
+
+  // Project ownership.
+  const project = await ensureProject(env.DB, userId, slug)
+  if (!project.ok) return json({ error: `slug "${slug}" is taken by another account` }, 409)
+
+  if (!request.body) return json({ error: 'empty body (expected gzipped tar)' }, 400)
+
+  // Unpack.
+  let entries
+  try {
+    entries = untar(await gunzip(request.body))
+  } catch (e) {
+    return json({ error: `could not read upload (expected .tar.gz): ${(e as Error).message}` }, 400)
+  }
+
+  const maxFiles = intVar(env.MAX_FILES, 5000)
+  const maxBytes = intVar(env.MAX_BYTES, 100 * 1024 * 1024)
+  const files = entries.filter((e) => safeEntryName(e.name) && e.data.length >= 0)
+  const bytes = files.reduce((n, f) => n + f.data.length, 0)
+  if (files.length === 0) return json({ error: 'no files in upload' }, 400)
+  if (files.length > maxFiles) return json({ error: `too many files (${files.length} > ${maxFiles})` }, 413)
+  if (bytes > maxBytes) return json({ error: `upload too large (${bytes} > ${maxBytes} bytes)` }, 413)
+
+  // Write to R2 under the slug prefix.
+  const prefix = `sites/${slug}/`
+  await Promise.all(files.map((f) => env.ASSETS.put(prefix + f.name, f.data)))
+
+  // Prune (po-9gk): a redeploy must converge the live site to EXACTLY the new
+  // export — objects from a previous deployment that are absent from this upload
+  // are deleted, so removed/re-slugged pages stop resolving instead of persisting
+  // as orphans. Upload first, then prune, so the site is never missing files
+  // mid-deploy. Deletion is scoped to this slug's prefix only.
+  const keep = new Set(files.map((f) => prefix + f.name))
+  const stale: string[] = []
+  let cursor: string | undefined
+  do {
+    const page = await env.ASSETS.list({ prefix, cursor })
+    for (const obj of page.objects) if (!keep.has(obj.key)) stale.push(obj.key)
+    cursor = page.truncated ? page.cursor : undefined
+  } while (cursor)
+  for (let i = 0; i < stale.length; i += 1000) {
+    await env.ASSETS.delete(stale.slice(i, i + 1000))
+  }
+
+  const deploymentId = await recordDeployment(env.DB, project.projectId, 'ready', files.length, bytes)
+  return json({
+    url: `https://${slug}.${env.ARC_HOST}`,
+    deployment_id: deploymentId,
+    status: 'ready',
+    files: files.length,
+    bytes,
+    pruned: stale.length,
+  })
+}
+
+// POST /v1/deploy/:id/source — upload the pre-build SOURCE tree for an already-recorded
+// deployment (po-ce7: an R2-backed workaround for Cloudflare Artifacts, which is
+// closed-beta and not yet enrolled on our account — see po-68u). The skill calls this
+// right after a successful /v1/deploy, tarring the source it just built FROM (excluding
+// node_modules/.git/out/.env*) and posting it here with the returned deployment_id.
+//
+// Immutable by construction: each deployment_id gets AT MOST one source snapshot —
+// claimSourceSnapshot's conditional UPDATE means a second POST for the same id 409s
+// rather than overwriting an earlier snapshot (the exact property that would have
+// prevented dpe-8qi). Never touches the existing built-output R2/D1 serving path.
+export async function handleUploadSource(request: Request, env: Env, deploymentId: string): Promise<Response> {
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const user = await userAuthForToken(env.DB, token)
+  if (!user) return json({ error: 'invalid token' }, 401)
+
+  const dep = await getDeploymentWithProject(env.DB, deploymentId)
+  if (!dep) return json({ error: `deployment "${deploymentId}" not found` }, 404)
+  if (dep.user_id !== user.id && !user.isStaff) {
+    return json({ error: `deployment "${deploymentId}" belongs to another account` }, 403)
+  }
+  if (dep.source_key) return json({ error: 'a source snapshot is already recorded for this deployment' }, 409)
+
+  if (!request.body) return json({ error: 'empty body (expected a gzipped tar)' }, 400)
+  const bytes = new Uint8Array(await request.arrayBuffer())
+  const maxSourceBytes = intVar(env.MAX_SOURCE_BYTES, 200 * 1024 * 1024)
+  if (bytes.length === 0) return json({ error: 'empty body (expected a gzipped tar)' }, 400)
+  if (bytes.length > maxSourceBytes) {
+    return json({ error: `source upload too large (${bytes.length} > ${maxSourceBytes} bytes)` }, 413)
+  }
+
+  // Claim the slot in D1 BEFORE writing R2, so a concurrent duplicate POST for the same
+  // deployment_id 409s instead of racing to overwrite the same key with different bytes.
+  const key = `sources/${dep.slug}/${deploymentId}.tar.gz`
+  const claim = await claimSourceSnapshot(env.DB, deploymentId, key, bytes.length)
+  if (claim === 'already_recorded') {
+    return json({ error: 'a source snapshot is already recorded for this deployment' }, 409)
+  }
+  await env.ASSETS.put(key, bytes)
+
+  return json({ ok: true, deployment_id: deploymentId, slug: dep.slug, key, bytes: bytes.length })
+}
+
+// GET /v1/repos/:slug/sources — list a slug's source-snapshot history (deployment id,
+// R2 key, size, timestamp), newest first. Gated to the recorded owner or Datopian staff
+// (po-ce7 acceptance criteria: retrievable by owner + staff, not anonymous).
+export async function handleListSources(request: Request, env: Env, slug: string): Promise<Response> {
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const user = await userAuthForToken(env.DB, token)
+  if (!user) return json({ error: 'invalid token' }, 401)
+  if (!validSlug(slug)) return json({ error: `invalid slug "${slug}"` }, 400)
+
+  const project = await getOwnedProject(env.DB, user.id, slug)
+  if (!project.ok) {
+    // 'not_found' means not found for EVERYONE, staff included — there's nothing to list.
+    if (project.reason === 'not_found') return json({ error: `repo "${slug}" not found` }, 404)
+    // 'conflict' (owned by someone else): staff may still inspect it.
+    if (!user.isStaff) return json({ error: `repo "${slug}" belongs to another account` }, 403)
+  }
+
+  const snapshots = await listSourceSnapshots(env.DB, slug)
+  return json({ slug, snapshots })
+}
+
+// GET /v1/repos/:slug/sources/:deploymentId — fetch one immutable source snapshot's
+// gzipped tar. Same owner-or-staff gate as the list endpoint.
+export async function handleGetSource(
+  request: Request,
+  env: Env,
+  slug: string,
+  deploymentId: string
+): Promise<Response> {
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const user = await userAuthForToken(env.DB, token)
+  if (!user) return json({ error: 'invalid token' }, 401)
+  if (!validSlug(slug)) return json({ error: `invalid slug "${slug}"` }, 400)
+
+  const dep = await getDeploymentWithProject(env.DB, deploymentId)
+  if (!dep || dep.slug !== slug) return json({ error: `deployment "${deploymentId}" not found for "${slug}"` }, 404)
+  if (dep.user_id !== user.id && !user.isStaff) {
+    return json({ error: `deployment "${deploymentId}" belongs to another account` }, 403)
+  }
+  if (!dep.source_key) return json({ error: 'no source snapshot recorded for this deployment' }, 404)
+
+  const obj = await env.ASSETS.get(dep.source_key)
+  if (!obj) return json({ error: 'source snapshot missing from storage' }, 404)
+  return new Response(obj.body, {
+    headers: {
+      'content-type': 'application/gzip',
+      'content-disposition': `attachment; filename="${slug}-${deploymentId}.tar.gz"`,
+    },
+  })
+}
+
+// POST /v1/repos/:slug/lfs-token — mint a scoped RS256 Giftless LFS token for the
+// authenticated Arc user. Guarded by the Arc API bearer token (device-flow
+// PORTALJS_TOKEN); 401 otherwise. The slug must ALREADY exist and be owned by the
+// caller (404 if it doesn't exist, 403 if another account owns it) — minting never
+// claims a slug, so user A can't mint for user B's repo or squat an unclaimed one.
+//   ?actions=write,verify → push token; DEFAULT is read-only (pull), least privilege
+//   ?ttl=<seconds>        → lifetime, capped at 24h; default 3600
+export async function handleLfsToken(request: Request, env: Env, slug: string): Promise<Response> {
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const user = await userRowForToken(env.DB, token)
+  if (!user) return json({ error: 'invalid token' }, 401)
+
+  if (!validSlug(slug)) return json({ error: `invalid slug "${slug}"` }, 400)
+
+  // The signer lives only as a Worker secret; fail loudly if it's not provisioned
+  // (e.g. `wrangler secret put GIFTLESS_JWT_PRIVATE_KEY` not yet run) rather than 500.
+  if (!env.GIFTLESS_JWT_PRIVATE_KEY) {
+    return json({ error: 'LFS token issuer not configured (GIFTLESS_JWT_PRIVATE_KEY unset)' }, 503)
+  }
+
+  const url = new URL(request.url)
+  const actions = normalizeActions(url.searchParams.get('actions'))
+  if (actions === null) return json({ error: 'invalid actions (use a subset of read,write,verify)' }, 400)
+  const ttl = normalizeTtl(Number(url.searchParams.get('ttl')) || undefined)
+
+  // Ownership: the project must ALREADY exist and belong to the caller. Minting a
+  // token must never create/claim a slug (po-g9y.13 security fix) — deploy the
+  // portal first (/portaljs-deploy), the only path that allocates a slug.
+  const project = await getOwnedProject(env.DB, user.id, slug)
+  if (!project.ok) {
+    return project.reason === 'not_found'
+      ? json({ error: `repo "${slug}" not found — deploy it first to claim the slug` }, 404)
+      : json({ error: `repo "${slug}" belongs to another account` }, 403)
+  }
+
+  let minted
+  try {
+    minted = await mintLfsToken(env.GIFTLESS_JWT_PRIVATE_KEY, {
+      slug,
+      actions,
+      ttl,
+      sub: `arc:${user.login}`,
+    })
+  } catch (e) {
+    return json({ error: `could not mint token: ${(e as Error).message}` }, 500)
+  }
+
+  const host = env.LFS_HOST || 'lfs.portaljs.com'
+  return json({
+    token: minted.token,
+    scope: minted.scope,
+    expires_in: minted.expiresIn,
+    // Credentialed LFS URL the client sets as `git config lfs.url` (local only).
+    lfs_url: `https://_jwt:${minted.token}@${host}/${LFS_ORG}/${slug}`,
+  })
+}
+
+// POST /v1/repos/:slug/claim — allocate the slug to the authenticated Arc user (or
+// confirm they already own it). Idempotent; 403 if another account owns it. This is
+// the EXPLICIT counterpart to the claim-on-mint side effect removed in po-g9y.13:
+// /portaljs-add-dataset calls this once before its first LFS push so a brand-new
+// (not-yet-deployed) portal can push data without hitting a 404 from /lfs-token.
+// Minting still NEVER claims. Same allocate-or-confirm semantics as /v1/deploy.
+export async function handleClaim(request: Request, env: Env, slug: string): Promise<Response> {
+  const auth = request.headers.get('authorization') ?? ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+  if (!token) return json({ error: 'missing bearer token' }, 401)
+  const user = await userRowForToken(env.DB, token)
+  if (!user) return json({ error: 'invalid token' }, 401)
+  if (!validSlug(slug)) return json({ error: `invalid slug "${slug}"` }, 400)
+
+  const project = await ensureProject(env.DB, user.id, slug)
+  if (!project.ok) return json({ error: `repo "${slug}" belongs to another account` }, 403)
+  return json({ ok: true, slug, owner: user.login })
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url)
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'authorization, content-type',
+        },
+      })
+    }
+    if (url.pathname === '/healthz') return json({ ok: true })
+    // whoami — let the CLI/skill confirm a stored token and show "Logged in as @user".
+    if (url.pathname === '/v1/whoami' && request.method === 'GET') {
+      const auth = request.headers.get('authorization') ?? ''
+      const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+      if (!token) return json({ error: 'missing bearer token' }, 401)
+      const login = await loginForToken(env.DB, token)
+      return login ? json({ login }) : json({ error: 'invalid token' }, 401)
+    }
+    if (url.pathname === '/v1/deploy' && request.method === 'POST') return handleDeploy(request, env)
+    // Match any non-empty segment and let the handler's validSlug() return a clean
+    // 400 for a malformed slug (e.g. "Bad_Slug") instead of falling through to 404.
+    const claimM = url.pathname.match(/^\/v1\/repos\/([^/]+)\/claim$/)
+    if (claimM && request.method === 'POST') return handleClaim(request, env, claimM[1])
+    const lfsM = url.pathname.match(/^\/v1\/repos\/([^/]+)\/lfs-token$/)
+    if (lfsM && request.method === 'POST') return handleLfsToken(request, env, lfsM[1])
+    // po-ce7 — source-snapshot upload + retrieval (Artifacts workaround).
+    const sourceUploadM = url.pathname.match(/^\/v1\/deploy\/([\w-]+)\/source$/)
+    if (sourceUploadM && request.method === 'POST') return handleUploadSource(request, env, sourceUploadM[1])
+    const sourceListM = url.pathname.match(/^\/v1\/repos\/([^/]+)\/sources$/)
+    if (sourceListM && request.method === 'GET') return handleListSources(request, env, sourceListM[1])
+    const sourceGetM = url.pathname.match(/^\/v1\/repos\/([^/]+)\/sources\/([\w-]+)$/)
+    if (sourceGetM && request.method === 'GET') return handleGetSource(request, env, sourceGetM[1], sourceGetM[2])
+    const m = url.pathname.match(/^\/v1\/deploy\/([\w-]+)$/)
+    if (m && request.method === 'GET') {
+      const row = await getDeployment(env.DB, m[1])
+      return row ? json(row) : json({ error: 'not found' }, 404)
+    }
+    return json({ error: 'not found' }, 404)
+  },
+}

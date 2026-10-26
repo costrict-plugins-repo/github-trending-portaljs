@@ -1,0 +1,13 @@
+# *
+User-agent: *
+Disallow: /people
+
+# *
+User-agent: *
+Disallow: /?amp=1
+
+# Host
+Host: https://www.portaljs.com
+
+# Sitemaps
+Sitemap: https://www.portaljs.com/sitemap.xml

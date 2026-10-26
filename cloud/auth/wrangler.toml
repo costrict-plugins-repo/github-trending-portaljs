@@ -1,0 +1,57 @@
+# PortalJS Arc — auth worker / dashboard (staging). Served at arc.portaljs.com apex.
+name = "arc-auth-staging"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+account_id = "83025b28472d6aa2bf5ae59f3724aa78"
+workers_dev = true
+
+[vars]
+BASE_URL = "https://arc-auth-staging.datopian.workers.dev"
+# GITHUB_CLIENT_ID is set per-environment; GITHUB_CLIENT_SECRET + SESSION_SECRET
+# are secrets (wrangler secret put), never committed.
+GITHUB_CLIENT_ID = "Ov23liXuXnCuAnyuIucc"
+# Passwordless email sign-in (po-e6j). EMAIL_FROM must be a Resend-verified sender;
+# RESEND_API_KEY is a secret: `wrangler secret put RESEND_API_KEY`.
+EMAIL_FROM = "PortalJS Arc <login@arc.portaljs.com>"
+# Server-side signup-completion capture (po-zbx). POSTHOG_KEY is the PUBLIC project key
+# (phc_…) — same value the marketing site exposes client-side, so the server event lands in
+# the same project and the /build funnel joins. Not a secret. POSTHOG_HOST is the EU ingestion
+# host. Must match the site's NEXT_PUBLIC_POSTHOG_KEY / NEXT_PUBLIC_POSTHOG_HOST.
+POSTHOG_KEY = "phc_P3zmWCCwtBk67JTTDVRHNRH0VMy8dZ10sn1pIfKyGTx"
+POSTHOG_HOST = "https://eu.i.posthog.com"
+# CRM provenance pipe (po-jdr). CRM_ENABLED is the write switch, checked at the call site in
+# crm.ts — deliberately absent here (off) because staging shares the SAME Twenty workspace as
+# production; only env.production below turns writes on. The full match/build path still runs
+# on staging, it just logs what it would have sent instead of sending it.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "portaljs-arc-staging"
+database_id = "9727b25f-471b-4942-8b16-b9da2391122a"
+
+# --- Production --- deploy with: wrangler deploy --env production
+# Prereq: proxied DNS record for arc.portaljs.com + ACM cert (already enabled) + a
+# PRODUCTION GitHub OAuth app (callback https://arc.portaljs.com/auth/callback). Set
+# GITHUB_CLIENT_ID below to that app's client ID before first prod deploy; set
+# GITHUB_CLIENT_SECRET + SESSION_SECRET via `wrangler secret put --env production`.
+[env.production]
+name = "arc-auth"
+workers_dev = false
+
+[env.production.vars]
+BASE_URL = "https://arc.portaljs.com"
+GITHUB_CLIENT_ID = "Ov23liIIMttPpNtaa9o7"
+EMAIL_FROM = "PortalJS Arc <login@arc.portaljs.com>"
+POSTHOG_KEY = "phc_P3zmWCCwtBk67JTTDVRHNRH0VMy8dZ10sn1pIfKyGTx"
+POSTHOG_HOST = "https://eu.i.posthog.com"
+# CRM writes are live only in production (see the staging comment above).
+CRM_ENABLED = "true"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "portaljs-arc"
+database_id = "ce13c71f-d039-45f3-95d0-f8005ed986e4"
+
+[[env.production.routes]]
+pattern = "arc.portaljs.com/*"
+zone_name = "portaljs.com"

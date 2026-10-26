@@ -1,0 +1,247 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { upsertCrmSignup } from '../src/crm'
+
+// upsertCrmSignup pipes a completed signup into Twenty as a `person` tagged with the caller's
+// `source` (po-jdr /build, po-k6n phase 2 CLI). It must: respect the CRM_ENABLED switch at the
+// call site, look up before writing (idempotent), match on email when present and on
+// login+source when not, and NEVER throw — a CRM failure must not be able to fail sign-in.
+describe('upsertCrmSignup (po-jdr, po-k6n)', () => {
+  const realFetch = globalThis.fetch
+  let calls: Array<{ url: string; init: any }>
+
+  beforeEach(() => {
+    calls = []
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), init })
+      return { ok: true, json: async () => ({ data: { people: [] } }) } as any
+    }) as any
+  })
+  afterEach(() => {
+    globalThis.fetch = realFetch
+  })
+
+  it('no-ops (no HTTP call) when CRM_ENABLED is unset — the staging default', async () => {
+    await upsertCrmSignup({ TWENTY_API_TOKEN: 'tok' }, { email: 'a@example.com', source: 'PORTALJS_BUILD' })
+    expect(calls).toHaveLength(0)
+  })
+
+  it('no-ops when CRM_ENABLED is anything other than the literal "true"', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'yes' },
+      { email: 'a@example.com', source: 'PORTALJS_BUILD' }
+    )
+    expect(calls).toHaveLength(0)
+  })
+
+  it('logs but never throws when enabled with no token configured', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(
+      upsertCrmSignup({ CRM_ENABLED: 'true' }, { email: 'a@example.com', source: 'PORTALJS_BUILD' })
+    ).resolves.toBeUndefined()
+    expect(calls).toHaveLength(0)
+    expect(errSpy).toHaveBeenCalled()
+    errSpy.mockRestore()
+  })
+
+  it('looks up by email, then POSTs a create when no match is found', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'new@example.com', source: 'PORTALJS_BUILD' }
+    )
+    expect(calls).toHaveLength(2)
+    expect(calls[0].url).toContain('/rest/people?filter=')
+    expect(decodeURIComponent(calls[0].url)).toContain('emails.primaryEmail[eq]:"new@example.com"')
+    expect(calls[1].url).toBe('https://crm.datopian.com/rest/people')
+    expect(calls[1].init.method).toBe('POST')
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.emails.primaryEmail).toBe('new@example.com')
+    expect(body.source).toBe('PORTALJS_BUILD')
+  })
+
+  // po-94q: `products` is multi-select, distinct from `source` — a new person starts their
+  // products array with just this write path's product.
+  it('seeds products with [PORTALJS] on create (po-94q)', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'new@example.com', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.products).toEqual(['PORTALJS'])
+  })
+
+  // po-94q: an existing person with no products yet (pre-dates the field, or their first
+  // product was never PortalJS) gets PORTALJS appended without disturbing other array entries.
+  it('appends PORTALJS to an existing person\'s products on update, preserving other entries (po-94q)', async () => {
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/people?filter=')) {
+        return { ok: true, json: async () => ({ data: { people: [{ id: 'person-1', products: ['DATAHUB'] }] } }) } as any
+      }
+      return { ok: true } as any
+    }) as any
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'existing@example.com', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.products).toEqual(['DATAHUB', 'PORTALJS'])
+  })
+
+  // po-94q: a repeat signup for a product the person already has must not resend/duplicate it —
+  // idempotency for `products` mirrors the idempotency already proven for the person match.
+  it('omits products from the PATCH payload when PORTALJS is already present (po-94q)', async () => {
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/people?filter=')) {
+        return { ok: true, json: async () => ({ data: { people: [{ id: 'person-1', products: ['PORTALJS'] }] } }) } as any
+      }
+      return { ok: true } as any
+    }) as any
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'existing@example.com', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect('products' in body).toBe(false)
+  })
+
+  it('PATCHes the existing person id when the lookup finds a match (idempotent)', async () => {
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/people?filter=')) {
+        return { ok: true, json: async () => ({ data: { people: [{ id: 'person-1' }] } }) } as any
+      }
+      return { ok: true } as any
+    }) as any
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'existing@example.com', source: 'PORTALJS_BUILD' }
+    )
+    expect(calls).toHaveLength(2)
+    expect(calls[1].url).toBe('https://crm.datopian.com/rest/people/person-1')
+    expect(calls[1].init.method).toBe('PATCH')
+  })
+
+  // po-96l: source is first-touch attribution — a later signup on a different surface must
+  // not rewrite an existing row's source. Only POST (create) may carry source.
+  it('never includes source in the PATCH payload, so a second surface cannot overwrite first-touch attribution (po-96l)', async () => {
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/people?filter=')) {
+        return { ok: true, json: async () => ({ data: { people: [{ id: 'person-1' }] } }) } as any
+      }
+      return { ok: true } as any
+    }) as any
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'existing@example.com', source: 'PORTALJS_CLI' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(calls[1].init.method).toBe('PATCH')
+    expect(body.source).toBeUndefined()
+    expect('source' in body).toBe(false)
+  })
+
+  it('matches on GitHub login + source when email is absent', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { login: 'octocat', source: 'PORTALJS_BUILD' }
+    )
+    expect(decodeURIComponent(calls[0].url)).toContain('name.firstName[eq]:"octocat"')
+    expect(decodeURIComponent(calls[0].url)).toContain('source[eq]:"PORTALJS_BUILD"')
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.name).toEqual({ firstName: 'octocat', lastName: '' })
+    expect(body.source).toBe('PORTALJS_BUILD')
+  })
+
+  // po-k6n: CLI device-flow sign-in shares the same GitHub OAuth callback as /build, so the
+  // same login can arrive with either source. The fallback match MUST key on source too, or a
+  // CLI sign-in from a contactless GitHub account would overwrite (or be shadowed by) a
+  // /build row for the same login instead of getting its own record.
+  it('keys the no-email fallback match on source, so /build and CLI rows for the same login stay separate', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { login: 'octocat', source: 'PORTALJS_CLI' }
+    )
+    expect(decodeURIComponent(calls[0].url)).toContain('name.firstName[eq]:"octocat"')
+    expect(decodeURIComponent(calls[0].url)).toContain('source[eq]:"PORTALJS_CLI"')
+    expect(decodeURIComponent(calls[0].url)).not.toContain('PORTALJS_BUILD')
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.source).toBe('PORTALJS_CLI')
+  })
+
+  it('splits a captured full name into Twenty\'s composite name.firstName/lastName (po-hvd)', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'anuar@example.com', fullName: 'Anuar Ustayev', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.name).toEqual({ firstName: 'Anuar', lastName: 'Ustayev' })
+  })
+
+  it('gives a single-word full name an empty lastName instead of dropping it (po-hvd)', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'cher@example.com', fullName: 'Cher', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.name).toEqual({ firstName: 'Cher', lastName: '' })
+  })
+
+  it('carries org through to the plain `organization` field (po-hvd)', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'anuar@example.com', org: 'Datopian', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.organization).toBe('Datopian')
+  })
+
+  it('omits name and organization when neither a full name nor an org was captured (po-hvd)', async () => {
+    await upsertCrmSignup(
+      { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+      { email: 'noname@example.com', source: 'PORTALJS_BUILD' }
+    )
+    const body = JSON.parse(calls[1].init.body)
+    expect(body.name).toBeUndefined()
+    expect(body.organization).toBeUndefined()
+  })
+
+  it('logs and skips when both email and login are absent', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await upsertCrmSignup({ TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' }, { source: 'PORTALJS_BUILD' })
+    expect(calls).toHaveLength(0)
+    expect(errSpy).toHaveBeenCalled()
+    errSpy.mockRestore()
+  })
+
+  it('never throws when the network fails', async () => {
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error('network down')
+    }) as any
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(
+      upsertCrmSignup(
+        { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+        { email: 'a@example.com', source: 'PORTALJS_BUILD' }
+      )
+    ).resolves.toBeUndefined()
+    errSpy.mockRestore()
+  })
+
+  it('never throws and logs on a non-2xx write response', async () => {
+    globalThis.fetch = vi.fn(async (url: any) => {
+      if (String(url).includes('/people?filter=')) return { ok: true, json: async () => ({ data: { people: [] } }) } as any
+      return { ok: false, status: 500, text: async () => 'boom' } as any
+    }) as any
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(
+      upsertCrmSignup(
+        { TWENTY_API_TOKEN: 'tok', CRM_ENABLED: 'true' },
+        { email: 'a@example.com', source: 'PORTALJS_BUILD' }
+      )
+    ).resolves.toBeUndefined()
+    expect(errSpy).toHaveBeenCalled()
+    errSpy.mockRestore()
+  })
+})

@@ -1,0 +1,53 @@
+{
+  "name": "portaljs",
+  "workspaces": [
+    "./packages/*"
+  ],
+  "version": "0.0.0",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "changeset": "changeset",
+    "release": "changeset publish",
+    "gen:skills": "node scripts/gen-skills-docs.mjs",
+    "gen:skills:check": "node scripts/gen-skills-docs.mjs --check",
+    "skills:check": "node scripts/check-skills-sync.mjs",
+    "verify": "bash scripts/verify.sh",
+    "setup": "bash scripts/verify.sh setup",
+    "lint": "bash scripts/verify.sh lint",
+    "typecheck": "bash scripts/verify.sh typecheck",
+    "test": "bash scripts/verify.sh test",
+    "build": "bash scripts/verify.sh build"
+  },
+  "private": true,
+  "overrides": {
+    "next": {
+      "postcss": "^8.5.31"
+    },
+    "mocha": {
+      "serialize-javascript": "^7.0.5"
+    },
+    "postcss-selector-parser": "^7.1.6",
+    "vite-plugin-dts": {
+      "@microsoft/api-extractor": "~7.56.3"
+    },
+    "lodash": "^4.18.1",
+    "minimatch@10": "^10.2.3",
+    "ajv@8": "^8.18.0"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.4.8",
+    "@changesets/cli": "^2.26.1",
+    "@types/node": "18.14.2",
+    "@types/react": "18.0.28",
+    "@types/react-dom": "18.0.11",
+    "@typescript-eslint/eslint-plugin": "^5.36.1",
+    "@typescript-eslint/parser": "^5.36.1",
+    "eslint": "~8.15.0",
+    "eslint-config-prettier": "8.1.0",
+    "prettier": "^2.6.2",
+    "typescript": "~4.9.5"
+  }
+}
